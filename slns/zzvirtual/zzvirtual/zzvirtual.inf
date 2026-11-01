@@ -1,0 +1,96 @@
+;
+; zzvirtual.inf
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=HIDClass ;Sample  ; TODO: specify appropriate Class
+ClassGuid={745a17a0-74d3-11d0-b6fe-00a0c90f57da} ;{78A1C341-4539-11d3-B88D-00C04FAD5171}   ; TODO: specify appropriate ClassGuid
+Provider=%ManufacturerName%
+CatalogFile=zzvirtual.cat
+DriverVer= ; TODO: set DriverVer in stampinf property pages
+PnpLockdown=1
+
+
+;[ClassInstall32]
+;Addreg=ClassReg
+;[ClassReg]
+;HKR,,,0,%ClassName%
+;HKR,,Icon,,-24
+
+[DestinationDirs]
+DefaultDestDir = 12
+zzvirtual_Device_CoInstaller_CopyFiles = 11
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+zzvirtual.sys  = 1,,
+WdfCoInstaller$KMDFCOINSTALLERVERSION$.dll=1 ; make sure the number matches with SourceDisksNames
+
+;*****************************************
+; Install Section
+;*****************************************
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%zzvirtual.DeviceDesc%=zzvirtual_Device, Root\zzvirtual ; TODO: edit hw-id
+
+[zzvirtual_Device.NT]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+zzvirtual.sys
+
+
+[zzvirtual_Device.NT.HW]
+AddReg=HWAddReg
+[HWAddReg]
+HKR,,"LowerFilters",0x00010008,"zzvirtual"
+
+;-------------- Service installation
+[zzvirtual_Device.NT.Services]
+AddService = zzvirtual,%SPSVCINST_ASSOCSERVICE%, zzvirtual_Service_Inst
+AddService=mshidkmdf,0x00000002,mshidkmdfService
+
+; -------------- zzvirtual driver install sections
+[zzvirtual_Service_Inst]
+DisplayName    = %zzvirtual.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\zzvirtual.sys
+[mshidkmdfService]
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\mshidkmdf.sys
+;
+;--- zzvirtual_Device Coinstaller installation ------
+;
+
+[zzvirtual_Device.NT.CoInstallers]
+AddReg=zzvirtual_Device_CoInstaller_AddReg
+CopyFiles=zzvirtual_Device_CoInstaller_CopyFiles
+
+[zzvirtual_Device_CoInstaller_AddReg]
+HKR,,CoInstallers32,0x00010000, "WdfCoInstaller$KMDFCOINSTALLERVERSION$.dll,WdfCoInstaller"
+
+[zzvirtual_Device_CoInstaller_CopyFiles]
+WdfCoInstaller$KMDFCOINSTALLERVERSION$.dll
+
+[zzvirtual_Device.NT.Wdf]
+KmdfService =  zzvirtual, zzvirtual_wdfsect
+[zzvirtual_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+SPSVCINST_ASSOCSERVICE= 0x00000000
+ManufacturerName="ZZ" ;TODO: Replace with your manufacturer name
+DiskName = "zzvirtual Installation Disk"
+zzvirtual.DeviceDesc = "zzvirtual Device"
+zzvirtual.SVCDESC = "zzvirtual Service"
+ClassName="ZZVIRTUAL"

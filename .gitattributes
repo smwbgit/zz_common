@@ -1,0 +1,7 @@
+*	text=auto
+*.txt	text
+*.sh	text eol=lf
+*.h	text eol=lf
+*.cpp	text eol=lf
+*.hpp	text eol=lf
+*.vcproj	text eol=crlf

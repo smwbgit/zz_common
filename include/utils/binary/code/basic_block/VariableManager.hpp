@@ -1,0 +1,639 @@
+﻿#pragma once
+
+#include <utils/binary/code/basic_block.hpp>
+#include <utils/IdGiver.hpp>
+
+namespace utils::binary::code::basic_block
+{
+	//给出基本块流程图中，所有变量的作用范围
+	class VariableManager
+	{
+	public:
+		struct s_range_in_block
+		{
+			uint64_t block_addr{};
+			uint64_t begin{};
+			uint64_t end{};
+		};
+		struct s_used_position
+		{
+			uint64_t addr{};	//block_addr+pos
+			uint64_t block_addr{};
+			uint64_t pos{};
+			bool is_read{};
+			bool is_write{};
+			bool is_assign{};
+		};
+		struct s_variable
+		{
+			uint64_t id{};	//变量id
+			uint64_t register_id{};
+			std::vector<s_range_in_block> scope;	//作用域
+			std::vector<s_used_position> used_positions;	//被使用的位置
+		};
+	private:
+		//一个块的上半部分或下半部分
+		struct s_half
+		{
+			uint64_t m_addr{};
+			bool m_is_come_from_upstream{};/*用来计算作用域是在节点的上边还是下边
+				（因为作用域是到节点中的赋值语句的，所以分上边和下边）*/
+
+			bool operator< (const s_half & other) const
+			{
+				if (m_addr != other.m_addr) return m_addr < other.m_addr;
+				if (m_is_come_from_upstream != other.m_is_come_from_upstream)
+					return (int)m_is_come_from_upstream < (int)other.m_is_come_from_upstream;
+				return false;
+			}
+			bool operator== (const s_half & other) const
+			{
+				return
+					m_addr == other.m_addr &&
+					m_is_come_from_upstream == other.m_is_come_from_upstream;
+			}
+		};
+	private:
+		const basic_block::Graph & m_graph;
+		std::map<uint64_t, s_variable> m_variables;
+		utils::IdGiver<uint64_t> m_id_giver;
+	public:
+		VariableManager(const basic_block::Graph & graph)
+			: m_graph{graph}
+		{
+			make();
+		}
+	private:
+		//识别出所有变量
+		void make(uint64_t register_id)
+		{
+			/*
+				核心思想：
+					利用赋值行为来分离出各个变量的作用域
+
+				具体算法：
+					当出现赋值行为时，当前块的向上或向下的链视为断开状态
+					尽可能沿着上下游的链，多遍历节点
+					最后，所有遍历到的节点，就是新变量的作用域
+					再依次按上面的办法，把被隔离的节点，也走一遍，直到所有节点都被遍历
+
+				补充细节：
+					对于上面的算法得出的作用域，还要做一次细分：
+					当一个作用域中节点，沿着自然路径，不能再碰到读或写这个变量的语句时，这个节点被视为
+					无关节点，对任何方向，都不再有传导性（也就是说，它上下游连接的节点，都视为其他变量的作用域）
+					这样，就可以把一个变量的作用域，分成几个部分：
+					1.若干个正常的作用域
+					2.若干个无关节点
+			*/
+			
+			//逐渐识别出每一个作用域
+			{
+				std::queue<s_half> wait; wait.push({m_graph.get_entry(), true});
+				std::set<s_half> visited;
+				std::vector<s_half> debug_queue;
+				while(!wait.empty())
+				{
+					//取出一个节点描述
+					const auto start = utils::queue(wait).pop();
+
+					//跳过访问过的
+					if(utils::set(visited).is_exist(start)) continue;
+
+					if(register_id == X86_REG_RCX && start == s_half{0x180031003, false})
+						while(0);
+				
+					debug_queue.push_back(start);
+
+					//计算与它相关的 一个正常作用域, 若干个无关节点, 和 若干个相邻作用域的节点
+					std::set<s_half> scope;
+					std::set<s_half> unrelated_nodes;
+					std::set<s_half> other_scope_nodes;
+					get_scope(register_id, start, scope, unrelated_nodes, other_scope_nodes);
+
+					//保存正常作用域
+					if (!scope.empty())
+					{
+						//简单检查: 此作用域 未和 已访问区域 重叠
+						utils_assert(utils::set(visited).get_intersection(scope).empty());
+				
+						//保存
+						add_variable(register_id, scope);
+
+						//此作用域 视为已访问过
+						utils::set(visited).insert_many_not_exist(scope);
+					}
+					else
+					{
+						//此节点 视为已访问过
+						utils::set(visited).insert_not_exist(start);
+					}
+
+					////保存无关节点
+					//{
+					//	//简单检查: 这些节点 未和 已访问区域 重叠
+					//	utils_assert(utils::set(visited).get_intersection(unrelated_nodes).empty());
+					//
+					//	//这些节点 视为已访问过
+					//	utils::set(visited).insert_many_not_exist(unrelated_nodes);
+					//}
+
+					//比邻的其他作用域节点 加入到等待访问中
+					utils::queue(wait).push_many(other_scope_nodes);
+
+					//无关节点 也加入到等待访问中, 使其能沿着无关节点，继续遍历
+					utils::queue(wait).push_many(unrelated_nodes);
+				}
+
+				//简单检查: 所有块均已遍历
+				utils_assert(visited.size() == m_graph.get_basic_blocks().size() * 2);
+			}
+
+			//补充上在基本块的夹层中出现的变量
+			for (const auto & block : utils::map(m_graph.get_basic_blocks()).iterator_seconds())
+			{
+				//查找节点
+				const auto & reg = utils::map(block->m_register_use_positions).get_existed_value(register_id);
+
+				//没有夹层
+				if(reg.m_assign_positions.size() <= 1) continue;
+
+				//保存
+				for(uint64_t i = 1; i < reg.m_assign_positions.size(); i++)
+					add_interlayer_variable(register_id, block.m_addr, i);
+			}
+
+			//已识别出全部的寄存器变量，识别每个变量的使用位置，包括读取和写入
+			for(auto & variable : utils::map(m_variables).iterator_seconds())
+			{
+				//只处理当前寄存器的变量
+				if(variable.register_id != register_id) continue;
+
+				//对于作用域中的每个节点，查找使用位置
+				for(const auto & scope_block : variable.scope)
+				{
+					//查找节点
+					const auto & block = m_graph.look_up_basic_block(scope_block.block_addr);
+					const auto & reg = utils::map(block->m_register_use_positions).get_existed_value(register_id);
+					
+					//对于节点中的每个汇编语句，检查是否使用了此变量
+					for(const auto & instruction : block.m_instructions)
+					{
+						//没在作用域内
+						const auto pos = instruction.first;
+						if (!(pos >= scope_block.begin && pos < scope_block.end)) continue;
+						
+						//查找节点
+						const auto & reg_positions = utils::map(reg.m_positions).get_existed_value(instruction.first);
+	
+						bool is_read = reg_positions.m_is_read;
+						bool is_write = reg_positions.m_is_write;
+						bool is_assign = reg_positions.m_is_assign;
+						//bool is_read = instruction.second.is_read_64bit_general_purpose_register(register_id);
+						//bool is_write = instruction.second.is_write_64bit_general_purpose_register(register_id);
+
+						//没有被使用
+						if(!is_read && !is_write) continue;
+
+						//保存
+						s_used_position used_position;
+						used_position.block_addr = block.m_addr;
+						used_position.pos = instruction.first;
+						used_position.addr = used_position.block_addr + used_position.pos;
+						used_position.is_read = is_read;
+						used_position.is_write = is_write;
+						used_position.is_assign = is_assign;
+						variable.used_positions.push_back(used_position);
+					}
+				}
+			}
+		}
+		//识别出所有变量
+		void make()
+		{
+			//每个寄存器的算法是一样的
+			for (const auto register_id : utils::binary::code::capstone::register_id::
+				get_all_64bit_general_purpose_register())
+			{
+				//转发
+				make(register_id);
+			}
+
+#if 1	//debug
+			std::u8string text_debug;
+			for(const auto register_id : utils::binary::code::capstone::register_id::get_all_64bit_general_purpose_register())
+			{
+				for (const auto & variable : m_variables)
+				{
+					if(variable.second.register_id != register_id) continue;
+
+					text_debug += utils::text::format::format(u8"%llu ", variable.second.id);
+					text_debug += utils::text::format::format(u8"%s:\n",
+						utils::binary::code::capstone::get_register_name(variable.second.register_id).c_str());
+					for(const auto & one : variable.second.scope)
+					{
+						text_debug += utils::text::format::format(u8"%llx ", one.block_addr);
+						//text_debug += utils::text::format::format(u8"%llx ", one.start);
+						//text_debug += utils::text::format::format(u8"%llx\n", one.end);
+					}
+					text_debug += u8"\n";
+					for(const auto & one : variable.second.used_positions)
+					{
+						//if (!one.is_write) continue;
+
+						//查找节点
+						const auto & block = m_graph.look_up_basic_block(one.block_addr);
+						const auto & instruction = utils::map(block.m_instructions).get_existed_value(one.pos);
+					
+						text_debug += utils::text::format::format(u8"%llx ", one.addr);
+						text_debug += utils::text::format::format(u8"%s %s\n",
+							instruction.m_insn.mnemonic,
+							instruction.m_insn.op_str);
+					}
+					text_debug += u8"\n";
+				}
+			}
+
+			{	//delete me
+				const auto & block = m_graph.look_up_basic_block(0x180030eb0);
+				const auto & reg = utils::map(block->m_register_use_positions).get_existed_value(X86_REG_R15);
+
+				while(0);
+			}
+			while(0);
+#endif
+		}
+		void get_scope(
+			const uint64_t register_id,
+			const s_half & start,
+			std::set<s_half> & scope,
+			std::set<s_half> & unrelated_nodes,
+			std::set<s_half> & other_scope_nodes)
+		{
+			std::set<s_half> last_scope;
+			unrelated_nodes.clear();
+			while(1)
+			{
+				//沿着上下游的链，尽可能多遍历节点, 来形成作用域
+				get_scope_1(register_id, start, unrelated_nodes, scope, other_scope_nodes);
+
+				//找出所有无关节点
+				auto _unrelated_nodes = get_unrelated_nodes(register_id, start, scope);
+				utils::set(unrelated_nodes).insert_many(_unrelated_nodes);
+
+				//已经是最少状态
+				if (scope.empty()) break;
+
+				//没有新的节点加入
+				if (scope == last_scope) break;
+
+				//简单检查
+				utils_assert(last_scope.empty() || scope.size() < last_scope.size());
+
+				//更新数据
+				last_scope = scope;
+			}
+		}
+		void get_scope_1(
+			const uint64_t register_id,
+			const s_half & start,
+			const std::set<s_half> & unrelated_nodes,
+			std::set<s_half> & scope,
+			std::set<s_half> & other_scope_nodes)
+		{
+			//准备数据
+			scope.clear();
+			other_scope_nodes.clear();
+
+			utils::algorithm::graph::BreadthFirstSearch<s_half> search;
+			search.m_entry = {start};
+			search.m_meet_one_node = [this, register_id, &scope, &other_scope_nodes, &unrelated_nodes](const s_half current)->std::set<s_half>
+			{
+				//查找节点
+				const auto & block = m_graph.look_up_basic_block(current.m_addr);
+				const auto & reg = utils::map(block->m_register_use_positions).get_existed_value(register_id);
+
+				//不相关节点
+				const bool is_unrelated_node = utils::set(unrelated_nodes).is_exist(current);
+
+				//如果是不相关节点
+				if (is_unrelated_node)
+				{
+					//把相连的节点，当做另一个作用域里的节点
+					if (current.m_is_come_from_upstream)
+					{
+						for (const auto block_addr : block->m_immediate_predecessor)
+							other_scope_nodes.insert({block_addr, false});
+						other_scope_nodes.insert({current.m_addr, false});
+					}
+					else
+					{
+						for (const auto block_addr : block->m_immediate_successor)
+							other_scope_nodes.insert({block_addr, true});
+						other_scope_nodes.insert({current.m_addr, true});
+					}
+
+					//不向任何方向遍历
+					return {};
+				}
+				//是普通节点
+				else
+				{
+					//收集此作用域
+					utils::set(scope).insert_not_exist(current);
+
+					//按节点是否被赋值语句截断，分两种情况，得出节点
+					std::set<s_half> next;
+					if (reg.m_assign_positions.empty())	//没被截断，此节点的两个方向，都要遍历
+					{
+						for (const auto block_addr : block->m_immediate_successor)
+							next.insert({block_addr, true});
+						for (const auto block_addr : block->m_immediate_predecessor)
+							next.insert({block_addr, false});
+						
+						//补充上当前节点的前半和后半部分
+						next.insert({current.m_addr, true});
+						next.insert({current.m_addr, false});
+					}
+					else	//被截断时, 只向一个方向遍历，另一个方向视为其他作用域
+					{
+						if(current.m_is_come_from_upstream)
+						{
+							for (const auto block_addr : block->m_immediate_predecessor)
+								next.insert({block_addr, false});
+							next.insert({current.m_addr, true});
+						}
+						else
+						{
+							for (const auto block_addr : block->m_immediate_successor)
+								next.insert({block_addr, true});
+							next.insert({current.m_addr, false});
+						}
+
+						//非此作用域的节点
+						other_scope_nodes.insert({current.m_addr, !current.m_is_come_from_upstream});
+					}
+
+					//给出
+					return next;
+				}
+			};
+			search.start();
+
+			//对other_scope_nodes来说，排除掉此作用域中的。（因为有时一个节点虽然被隔开了，但有可能从另一个路径能到达这个节点）
+			utils::set(other_scope_nodes).remove_intersection(scope);
+		}
+		//找出所有无关节点
+		std::set<s_half> get_unrelated_nodes(
+			const uint64_t register_id,
+			const s_half & start,
+			const std::set<s_half> & scope)
+		{
+			//无关节点: 沿着自然路径，不会碰到使用这个变量的语句
+
+			//具体算法，为了加速，改为：
+			//  找出所有的使用变量的节点，然后从这些节点向上遍历，标记所有遇见的节点。
+			//  最后，没被标记的，就是无关节点
+
+			//找出所有使用变量的节点
+			std::set<s_half> use_nodes;
+			for (const auto& node : scope)
+			{
+				if (is_node_use_variable(register_id, node, scope))
+					utils::set(use_nodes).insert_not_exist(node);
+			}
+
+			//从这些节点向上遍历，标记所有遇见的节点
+			std::set<s_half> related_nodes;
+			{
+				utils::algorithm::graph::BreadthFirstSearch<s_half> search;
+				search.m_entry = use_nodes;
+				search.m_meet_one_node = [&related_nodes, this, &scope](const s_half current)->std::set<s_half>
+				{
+					//标记
+					utils::set(related_nodes).insert_not_exist(current);
+
+					//查找节点
+					const auto & block = m_graph.look_up_basic_block(current.m_addr);
+				
+					//向上遍历
+					std::set<s_half> next;
+					if(current.m_is_come_from_upstream)
+					{
+						for (const auto block_addr : block->m_immediate_predecessor)
+							next.insert({block_addr, false});
+					}
+					else
+					{
+						next.insert({current.m_addr, true});
+					}
+
+					//限定在作用域内
+					next = utils::set(scope).get_intersection(next);
+
+					//给出
+					return next;
+				};
+				search.start();
+			}
+
+			//简单检查
+			utils_assert(utils::set(scope).get_intersection(related_nodes) == related_nodes);
+
+			//没被标记的，就是无关节点
+			auto unrelated_nodes = scope;
+			utils::set(unrelated_nodes).remove_intersection(related_nodes);
+			return unrelated_nodes;
+		}
+		//是否使用了变量
+		bool is_node_use_variable(const uint64_t register_id, const s_half & node,
+			const std::set<s_half> & scope)
+		{
+			//查找节点
+			const auto & block = m_graph.look_up_basic_block(node.m_addr);
+			const auto & reg = utils::map(block->m_register_use_positions).get_existed_value(register_id);
+				
+			//是否为全区域
+			bool is_whole_block = utils::set(scope).is_exist({node.m_addr, !node.m_is_come_from_upstream});
+
+			//检查是否使用了此变量
+			bool is_use_variable{};
+			if(is_whole_block)
+			{
+				//有读写行为
+				if (!reg.m_assign_positions.empty() || !reg.m_read_positions.empty())
+				{
+					is_use_variable = true;
+				}
+			}
+			else
+			{
+				//上半部分
+				if(node.m_is_come_from_upstream)
+				{
+					//简单检查
+					utils_assert(!reg.m_assign_positions.empty());
+						
+					//检查在第一个赋值之前，是否有读行为
+					const auto first_assign = reg.m_assign_positions[0];
+					for (const auto & read : reg.m_read_positions)
+					{
+						if (read < first_assign)
+						{
+							is_use_variable = true;
+							break;
+						}
+					}
+				}
+				//下半部分
+				else
+				{
+					//简单检查
+					utils_assert(!reg.m_assign_positions.empty());
+						
+					is_use_variable = true;
+				}
+			}
+
+			return is_use_variable;
+		}
+#if 0
+			get_scope_3(register_id, node, scope, unrelated_nodes);
+			{
+				std::set<s_half> scope;
+				std::set<s_half> other_scope_nodes;
+				scopes.push_back(scope);
+			}
+			const auto 
+
+			//对于每个节点，沿着自然路径，检查是否能碰到读或写这个变量的语句
+			for(const auto & node : scope_1)
+			{
+				bool is_unrelated_node = is_unrelated_node();
+				utils::algorithm::graph::BreadthFirstSearch<s_half> search;
+				search.m_entry = {node};
+				search.m_meet_one_node = [this, register_id, &unrelated_nodes](const s_half current)->std::set<s_half>
+				{
+					//查找节点
+					const auto& block = m_graph.look_up_basic_block(current.m_addr);
+					const auto& reg = utils::map(block->m_register_use_positions).get_existed_value(register_id);
+					//对于节点中的每个汇编语句，检查是否使用了此变量
+					for (const auto& instruction : block.m_instructions)
+					{
+						//没在作用域内
+						const auto pos = instruction.first;
+						if (!(pos >= 0 && pos < block.m_size)) continue;
+						bool is_read = instruction.second.is_read_64bit_general_purpose_register(register_id);
+						bool is_write = instruction.second.is_write_64bit_general_purpose_register(register_id);
+						//没有被使用
+						if (!is_read && !is_write) continue;
+						//保存
+						s_used_position used_position;
+						used_position.block_addr = block.m_addr;
+						used_position.pos = instruction.first;
+						used_position.addr = used_position.block_addr + used_position.pos;
+						used_position.is_read = is_read;
+						used_position.is_write = is_write;
+						utils::set(unrelated_nodes).insert_not_exist(current);
+					}
+					//给出
+					return {};
+				};
+			}
+#endif
+		void add_variable(const uint64_t register_id, const std::set<s_half> & scope)
+		{
+			//获得id
+			s_variable variable;
+			variable.id = m_id_giver.get_one_id();
+
+			//填写信息
+			variable.register_id = register_id;
+
+			//简单检查
+			utils_assert(!scope.empty());
+
+			//把基本块分成两种：全部覆盖和只覆盖上边或下边
+			std::set<s_half> half_blocks;
+			std::set<uint64_t> whole_blocks;
+			{
+				//统计每个块的个数
+				std::map<uint64_t, uint64_t> counts;
+				for(const auto & block : scope)
+					counts[block.m_addr] ++;
+					
+				//按个数来分类
+				std::map<uint64_t, uint64_t> insert_counts;
+				for(const auto & block : scope)
+				{
+					if(counts[block.m_addr] == 1)
+						utils::set(half_blocks).insert_not_exist(block);
+					else if(counts[block.m_addr] == 2)
+					{
+						if (insert_counts[block.m_addr] == 0)
+							utils::set(whole_blocks).insert_not_exist(block.m_addr);
+						else
+							utils_assert(insert_counts[block.m_addr] == 1);
+					}
+					else
+						utils_throw();
+						
+					insert_counts[block.m_addr] ++;
+				}
+			}
+
+			//全部覆盖的基本块
+			for(const auto block_addr : whole_blocks)
+			{
+				//查找节点
+				const auto & block = m_graph.look_up_basic_block(block_addr);
+
+				//添加
+				variable.scope.push_back({block_addr, 0, block.m_size});
+			}
+
+			//只覆盖上边或下边的块
+			for(const auto & half_block : half_blocks)
+			{
+				//查找节点
+				const auto & block = m_graph.look_up_basic_block(half_block.m_addr);
+				const auto & reg = utils::map(block->m_register_use_positions).get_existed_value(register_id);
+
+				//简单检查
+				utils_assert(!reg.m_assign_positions.empty());
+
+				//添加
+				if (half_block.m_is_come_from_upstream)
+					variable.scope.push_back({block.m_addr, 0, reg.m_assign_positions[0]});
+				else
+					variable.scope.push_back({block.m_addr, utils::vector(reg.m_assign_positions).last_one(), block.m_size});
+			}
+
+			//保存
+			utils::map(m_variables).insert_not_exist(variable.id, std::move(variable));
+		}
+		void add_interlayer_variable(const uint64_t register_id, const uint64_t block_addr, uint64_t i)
+		{
+			//获得id
+			s_variable variable;
+			variable.id = m_id_giver.get_one_id();
+
+			//填写信息
+			variable.register_id = register_id;
+				
+			//查找节点
+			const auto & block = m_graph.look_up_basic_block(block_addr);
+			const auto & reg = utils::map(block->m_register_use_positions).get_existed_value(register_id);
+				
+			//简单检查
+			utils_assert(reg.m_assign_positions.size() >= 2);
+			utils_assert(i >= 1);
+			utils_assert(i < reg.m_assign_positions.size());
+				
+			//填写信息
+			variable.scope.push_back({block.m_addr, reg.m_assign_positions[i-1], reg.m_assign_positions[i]});
+
+			//保存
+			utils::map(m_variables).insert_not_exist(variable.id, std::move(variable));
+		}
+	};
+}
